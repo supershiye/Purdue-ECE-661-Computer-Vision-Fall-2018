@@ -1,0 +1,202 @@
+%% ECE 661 2018 Fall Homework 8
+% Ye Shi
+% shi349@purdue.edu
+
+close all;clear; clc;
+grayread = @(x) rgb2gray(imresize(imread(x),[480 640]));
+%% Import training images
+folder = 'Dataset2'; % select dataset
+dataset = struct('data',[],'corner',[]);
+files = dir(folder);
+files([1,2]) = []; % take out . and ..
+num = numel(files);
+% num = 2
+for i = 1:num
+    dataset(i).name = files(i).name;
+    dataset(i).data = grayread([files(i).folder,'\',files(i).name]);
+end
+clear i;
+%% Find corners in all images
+for i = 1:num
+    dataset(i).corner =findCorner(dataset(i).data,[folder,'results','\',files(i).name(1:end-4)]);
+end
+clear i
+%% World Plane image corners
+world.corner=zeros(80,2);
+l = 0;
+% imshow(zeros(800,600))
+for i=1:10
+    for j=1:8
+        l=l+1;
+        world.corner(l,:) =[(j-1)*25 (i-1)*25];
+        world.label(l) = l;
+    end
+end
+clear l i j
+%% Find homography
+% num = 2
+for i = 1:num
+    if numel(dataset(i).corner) == 80
+        dataset(i).H = findH([world.corner,reshape(extractfield(...
+            dataset(i).corner,'corner'),2,80)']);
+    end
+end
+
+% combine the homographies
+HvecSet = extractfield(dataset,'H');
+Hnum = length(HvecSet)/9;
+HvecSet = reshape(HvecSet,9,Hnum)';
+clear Hnum
+
+%% Find the intrinsic camer matrix K
+K = findK(HvecSet)
+
+%% Find the external camera calibration matrix R|t
+for i = 1:num
+    if ~isempty(dataset(i).H)
+        [dataset(i).R,dataset(i).t] = findRt(dataset(i).H,K);
+    end
+end
+
+%% LM refinement
+
+options.Algorithm = 'levenberg-marquardt';
+options.FunctionTolerance =1e-8;
+p0= zeros(1,7+num*6+1);
+p0(1:5) = [K(1,1) K(1,2) K(1,3) K(2,2) K(2,3)];
+for i = 1:num
+    if ~isempty(dataset(i).H)
+        p0((i-1)*6+8:i*6+7) = [rotationMatrixToVector(dataset(i).R),...
+            dataset(i).t'];
+    else
+        p0((i-1)*6+8:i*6+7) = zeros(1,6);
+    end
+end
+
+% Without radical distortion
+P = lsqnonlin(@dgeom,p0,[],[],options,world,dataset);
+% Conduct to K
+LMK = [P(1) P(2) P(3); 0 P(4) P(5); 0 0 1]
+for i = 1:num
+    if ~isempty(dataset(i).H)
+        dataset(i).LMR= rotationVectorToMatrix(P((i-1)*6+8:(i-1)*6+10));
+        dataset(i).LMt = P(i*6+7-2:i*6+7)';
+    end
+end
+
+
+% With radical distortion
+p(6) =  -6.8609e-09;
+p(7) =   4.2824e-14;
+p0(end) =1;
+P = lsqnonlin(@dgeom,p0,[],[],options,world,dataset);
+% Conduct to K
+LMKr = [P(1) P(2) P(3); 0 P(4) P(5); 0 0 1]
+LMk1 = P(6)
+LMk2 = P(7)
+for i = 1:num
+    if ~isempty(dataset(i).H)
+        dataset(i).LMRr= rotationVectorToMatrix(P((i-1)*6+8:(i-1)*6+10));
+        dataset(i).LMtr = P(i*6+7-2:i*6+7)';
+    end
+end
+
+
+%% Comparsion for projection
+HC2R = @(P) (P(1:2,:)./P(end,:))';
+
+for i = 1:num
+    if ~isempty(dataset(i).H)
+        % LSE
+        dataset(i).est = HC2R(K*[dataset(i).R dataset(i).t]* ...
+            [world.corner zeros(80,1) ones(80,1)]');
+        err = vecnorm(dataset(i).est - reshape(extractfield(...
+            dataset(i).corner,'corner'),2,80)',2,2);
+        dataset(i).estmean = mean(err);
+        dataset(i).estvar = var(err);
+        
+        % After refine
+        
+        dataset(i).LMest = HC2R(LMK*[dataset(i).LMR dataset(i).LMt]* ...
+            [world.corner zeros(80,1) ones(80,1)]');
+        err = vecnorm(dataset(i).LMest - reshape(extractfield(...
+            dataset(i).corner,'corner'),2,80)',2,2);
+        dataset(i).LMestmean = mean(err);
+        dataset(i).LMestvar = var(err);
+        
+        % Radial Distortion
+        est_corners = LMKr * [dataset(i).LMRr dataset(i).LMtr] *...
+            [world.corner zeros(80,1) ones(80,1)]';
+        est_corners = est_corners./est_corners(end,:);
+        r = sum([est_corners(1,:);est_corners(2,:)].^2,1);
+        xrad = est_corners(1,:) + (est_corners(1,:)-240).*(LMk1.*r+LMk2.*r.^2);
+        yrad = est_corners(2,:) + (est_corners(2,:)-320).*(LMk1.*r+LMk2.*r.^2);
+        dataset(i).LMrest =[xrad;yrad]';
+        err = vecnorm(dataset(i).LMrest - reshape(extractfield(...
+            dataset(i).corner,'corner'),2,80)',2,2);
+        dataset(i).LMrestmean = mean(err);
+        dataset(i).LMrestvar = var(err);
+        
+    end
+end
+
+%% Draw comparsion images
+for i = 1:num
+    if ~isempty(dataset(i).H)
+        f = figure;
+        imshow(dataset(i).data)
+        hold on
+        scatter(dataset(i).est(:,1),dataset(i).est(:,2),60,'+','MarkerEdgeColor','b','MarkerFaceColor','b');
+        hold on
+        scatter(dataset(i).LMest(:,1),dataset(i).LMest(:,2),60,'x','MarkerEdgeColor','r','MarkerFaceColor','r');
+        hold on
+        for j = 1:80
+            text(dataset(i).corner(j).corner(1),dataset(i).corner(j).corner(2),int2str(dataset(i).corner(j).label),'Color','yellow','FontSize',7);
+            hold on
+        end
+        hold off;
+        img = getframe();
+        imwrite(img.cdata,[folder,'results','\',files(i).name(1:end-4),'_LM.png'])
+        close(f)
+        
+        f = figure;
+        imshow(dataset(i).data)
+        hold on
+        scatter(dataset(i).LMest(:,1),dataset(i).LMest(:,2),60,'x','MarkerEdgeColor','r','MarkerFaceColor','r');
+        hold on
+        scatter(dataset(i).LMrest(:,1),dataset(i).LMrest(:,2),60,'+','MarkerEdgeColor','g','MarkerFaceColor','g');
+        hold on
+        for j = 1:80
+            text(dataset(i).corner(j).corner(1),dataset(i).corner(j).corner(2),int2str(dataset(i).corner(j).label),'Color','yellow','FontSize',7);
+            hold on
+        end
+        hold off;
+        img = getframe();
+        imwrite(img.cdata,[folder,'results','\',files(i).name(1:end-4),'_LMr.png'])
+        %         w = waitforbuttonpress;
+        close(f)
+    end
+end
+
+
+%% Re-project to Fixed Image
+if folder(end) == '1'
+    f = 3;
+    t = [1 23 4 7];
+elseif folder(end) == '2'
+        f = 5;
+    t = [2 6 14 19];
+end
+
+% profermence matrix
+M = zeros(4,2);
+k= 0;
+for i = t
+    k = k+1;
+   [ M(k,1),M(k,2) ]= reproj(dataset(f), dataset(i), LMK)
+end
+
+
+
+%%
+save([folder,'results','\',datestr(datetime(),30)]);
